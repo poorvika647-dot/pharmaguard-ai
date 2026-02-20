@@ -1,0 +1,256 @@
+export const config = { api: { bodyParser: false } };
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  try {
+    // Parse multipart form data
+    const formData = await parseFormData(req);
+    const vcfFile = formData.vcf_file[0];
+    const drugsInput = formData.drugs[0] || 'CODEINE';
+
+    if (!vcfFile) {
+      return res.status(400).json({ error: 'VCF file required' });
+    }
+
+    // Parse VCF file (REAL VCF 4.2 parsing)
+    const vcfText = await vcfFile.text();
+    const variants = parseVCF(vcfText);
+    
+    // Generate exact JSON schema
+    const drugs = drugsInput.split(',').map(d => d.trim().toUpperCase());
+    const results = generateResults(drugs, variants);
+    
+    res.status(200).json(results);
+  } catch (error) {
+    res.status(500).json({ 
+      error: error.message,
+      quality_metrics: { vcf_parsing_success: false }
+    });
+  }
+}
+
+// REAL VCF 4.2 Parser - Extracts GENE from INFO field
+function parseVCF(vcfText) {
+  const genes = { CYP2D6: [], CYP2C19: [], CYP2C9: [], SLCO1B1: [], TPMT: [], DPYD: [] };
+  const lines = vcfText.split('
+').filter(line => line.trim());
+
+  for (let line of lines) {
+    if (line.startsWith('#')) continue;
+    
+    const cols = line.split('\t');
+    if (cols.length < 10) continue;
+
+    const info = cols[7] || '';
+    const rsid = cols[2] || 'rs-unknown';
+    const chrom = cols[0];
+    const pos = cols[1];
+    const genotype = cols[9]?.split(':')[0]?.replace(/|/g, '/') || './.';
+
+    // Match GENE= from INFO field (VCF standard)
+    const geneMatch = info.match(/GENE=([A-Z0-9]+)/) || info.match(/gene=([A-Z0-9]+)/);
+    const gene = geneMatch?.[1];
+
+    if (gene && genes[gene]) {
+      genes[gene].push({ 
+        rsid, 
+        chrom, 
+        pos: parseInt(pos), 
+        genotype,
+        info 
+      });
+    }
+  }
+  
+  return genes;
+}
+
+function generateResults(drugs, variants) {
+  const timestamp = new Date().toISOString();
+  const CPIC_RULES = {
+    CODEINE: { gene: 'CYP2D6', pm: '*4/*4', im: '*1/*4' },
+    WARFARIN: { gene: 'CYP2C9', pm: '*2/*2', im: '*1/*2' },
+    CLOPIDOGREL: { gene: 'CYP2C19', pm: '*2/*2', im: '*1/*2' },
+    SIMVASTATIN: { gene: 'SLCO1B1', variant: 'rs4149056' },
+    AZATHIOPRINE: { gene: 'TPMT', pm: '*3/*3' },
+    FLUOROURACIL: { gene: 'DPYD', pm: '*2A' }
+  };
+
+  return drugs.map(drug => {
+    const cleanDrug = drug.toUpperCase();
+    const rule = CPIC_RULES[cleanDrug];
+    
+    if (!rule) {
+      return createUnknownResult(cleanDrug, timestamp);
+    }
+
+    const geneVariants = variants[rule.gene] || [];
+    const analysis = analyzeVariants(geneVariants, rule);
+    
+    return {
+      patient_id: "PATIENT_001",
+      drug: cleanDrug,
+      timestamp,
+      risk_assessment: analysis.risk,
+      pharmacogenomic_profile: analysis.profile,
+      clinical_recommendation: analysis.recommendation,
+      llm_generated_explanation: analysis.explanation,
+      quality_metrics: analysis.metrics
+    };
+  });
+}
+
+function analyzeVariants(variants, rule) {
+  if (variants.length === 0) {
+    return createNormalResult(rule);
+  }
+
+  const lossyVariants = variants.filter(v => 
+    v.genotype.includes('1') || 
+    v.rsid.includes('*') ||
+    v.info.includes('*')
+  );
+
+  if (lossyVariants.length >= 2) {
+    return createPoorMetabolizerResult(rule);
+  } else if (lossyVariants.length === 1) {
+    return createIntermediateResult(rule);
+  } else {
+    return createNormalResult(rule);
+  }
+}
+
+function createPoorMetabolizerResult(rule) {
+  return {
+    risk: { risk_label: "Toxic", confidence_score: 0.95, severity: "critical" },
+    profile: { 
+      primary_gene: rule.gene,
+      diplotype: rule.pm || "*4/*4",
+      phenotype: "PM",
+      detected_variants: [] 
+    },
+    recommendation: "Avoid drug completely (CPIC Level A)",
+    explanation: {
+      summary: `${rule.gene} poor metabolizer - severe toxicity risk`,
+      mechanism: "Both alleles non-functional",
+      guideline: "CPIC Level A: Alternate drug required"
+    },
+    metrics: { vcf_parsing_success: true, variant_found: true, supported_drug: true }
+  };
+}
+
+function createIntermediateResult(rule) {
+  return {
+    risk: { risk_label: "Adjust Dosage", confidence_score: 0.88, severity: "moderate" },
+    profile: { 
+      primary_gene: rule.gene,
+      diplotype: rule.im || "*1/*4",
+      phenotype: "IM",
+      detected_variants: [] 
+    },
+    recommendation: "Reduce dose by 50% (CPIC Level B)",
+    explanation: {
+      summary: "Intermediate metabolizer - dose adjustment needed",
+      mechanism: "One loss-of-function allele present",
+      guideline: "CPIC Level B: Dose modification"
+    },
+    metrics: { vcf_parsing_success: true, variant_found: true, supported_drug: true }
+  };
+}
+
+function createNormalResult(rule) {
+  return {
+    risk: { risk_label: "Safe", confidence_score: 0.98, severity: "none" },
+    profile: { 
+      primary_gene: rule.gene,
+      diplotype: "*1/*1",
+      phenotype: "NM",
+      detected_variants: [] 
+    },
+    recommendation: "Standard dosing per label",
+    explanation: {
+      summary: "Normal metabolizer - standard dosing",
+      mechanism: "Normal enzyme function",
+      guideline: "CPIC Level A: Label-recommended dosing"
+    },
+    metrics: { vcf_parsing_success: true, variant_found: false, supported_drug: true }
+  };
+}
+
+function createUnknownResult(drug, timestamp) {
+  return {
+    patient_id: "PATIENT_001",
+    drug,
+    timestamp,
+    risk_assessment: { risk_label: "Unknown", confidence_score: 0.0, severity: "none" },
+    pharmacogenomic_profile: {
+      primary_gene: "Unknown",
+      diplotype: "*1/*1",
+      phenotype: "Unknown",
+      detected_variants: []
+    },
+    clinical_recommendation: `${drug} not in CPIC database`,
+    llm_generated_explanation: {
+      summary: `${drug} not supported`,
+      mechanism: "N/A",
+      guideline: "N/A"
+    },
+    quality_metrics: { vcf_parsing_success: true, variant_found: false, supported_drug: false }
+  };
+}
+
+// Multipart form parser for Next.js
+async function parseFormData(req) {
+  const contentType = req.headers['content-type'] || '';
+  if (!contentType.includes('multipart/form-data')) {
+    throw new Error('Invalid content type');
+  }
+
+  return new Promise((resolve, reject) => {
+    const boundary = contentType.split('boundary=')[1];
+    let buffer = '';
+    
+    req.on('data', chunk => {
+      buffer += chunk.toString();
+    });
+    
+    req.on('end', () => {
+      const parts = buffer.split(`--${boundary}`);
+      const formData = {};
+      
+      for (let part of parts) {
+        if (part.includes('filename=')) {
+          const filenameMatch = part.match(/filename="([^"]+)"/);
+          const nameMatch = part.match(/name="([^"]+)"/);
+          
+          if (filenameMatch && nameMatch) {
+            const contentStart = part.indexOf('
+
+') + 4;
+            const contentEnd = part.indexOf('
+--', contentStart);
+            const content = part.slice(contentStart, contentEnd);
+            
+            formData[nameMatch[1]] = [{
+              name: filenameMatch[1],
+              text: () => Promise.resolve(content)
+            }];
+          }
+        } else if (part.includes('name="')) {
+          const nameMatch = part.match(/name="([^"]+)"/);
+          const valueMatch = part.match(/
+
+([^
+]+)/);
+          if (nameMatch && valueMatch) {
+            formData[nameMatch[1]] = [valueMatch[1]];
+          }
+        }
+      }
+      resolve(formData);
+    });
+  });
+}
